@@ -46,6 +46,8 @@
   #tide{position:fixed;top:58px;left:50%;transform:translateX(-50%);width:min(520px,70vw);z-index:10;pointer-events:none}
   #tide .lbl{display:flex;justify-content:space-between;font-size:9px;letter-spacing:.25em;color:var(--dim);margin-bottom:4px}
   #tide .lbl b:first-child{color:var(--gold)} #tide .lbl b:last-child{color:var(--crimson)}
+  #tide .walls{margin-top:5px;font-size:10px}
+  #tide .walls b:first-child{color:var(--gold-hot)} #tide .walls b:last-child{color:var(--crimson-hot)}
   #tidebar{height:5px;border-radius:3px;overflow:hidden;background:var(--crimson);box-shadow:0 0 14px rgba(224,54,79,.35)}
   #tidefill{height:100%;width:50%;background:linear-gradient(90deg,var(--gold),var(--gold-hot));
     box-shadow:0 0 14px rgba(232,182,76,.6);transition:width .8s cubic-bezier(.2,.8,.2,1)}
@@ -108,7 +110,8 @@
 </div>
 
 <div id="tide"><div class="lbl"><b>⚔ BULL LEGION</b><b>BEAR HORDE ⚔</b></div>
-  <div id="tidebar"><div id="tidefill"></div></div></div>
+  <div id="tidebar"><div id="tidefill"></div></div>
+  <div class="lbl walls"><b id="buywall">BUY WALL —</b><b id="sellwall">SELL WALL —</b></div></div>
 
 <div class="hud" id="killfeed"></div>
 
@@ -461,12 +464,18 @@ const soldierGeo=(()=>{
   spear.rotateX(Math.PI/10);spear.translate(.44,1.6,.24);
   return mergeGeometries([body,head,spear]);
 })();
-function makeArmy(){
+function makeArmy(cap=POOL){
   const m=new THREE.InstancedMesh(soldierGeo,
-    new THREE.MeshLambertMaterial({}),POOL);
+    new THREE.MeshLambertMaterial({}),cap);
   m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   m.frustumCulled=false;
   return m;
+}
+function hideAll(mesh,cap){
+  const d=new THREE.Object3D();
+  d.position.set(0,-999,0);d.scale.setScalar(0.0001);d.updateMatrix();
+  for(let i=0;i<cap;i++){mesh.setMatrixAt(i,d.matrix);mesh.setColorAt(i,new THREE.Color(0xffffff));}
+  mesh.instanceMatrix.needsUpdate=true;mesh.instanceColor.needsUpdate=true;
 }
 const meshB=makeArmy(),meshR=makeArmy();
 scene.add(meshB,meshR);
@@ -778,6 +787,127 @@ function scorchDot(x,z,rPx,bull){
   needMap=true;
 }
 
+/* ================= ORDER BOOK — the standing armies =================
+   Resting limit orders ARE massed troops: bid walls = gold ranks holding
+   ground south of the front, ask walls = crimson ranks dug in north of it,
+   each formation at its actual price level, headcount ∝ notional. They
+   stand in the eastern margin — the unwritten future — waiting for price. */
+const BOOKCAP=1500;
+const bookB=makeArmy(BOOKCAP),bookR=makeArmy(BOOKCAP);
+scene.add(bookB,bookR);
+hideAll(bookB,BOOKCAP);hideAll(bookR,BOOKCAP);
+const book={bids:[],asks:[]};
+const wallLabels=[];
+for(let i=0;i<8;i++){
+  const c=document.createElement('canvas');c.width=460;c.height=96;
+  const tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;
+  const spr=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,
+    depthTest:false,depthWrite:false,fog:false}));
+  spr.renderOrder=998;spr.visible=false;scene.add(spr);
+  wallLabels.push({spr,tex,ctx:c.getContext('2d')});
+}
+const buyWallEl=document.getElementById('buywall'),sellWallEl=document.getElementById('sellwall');
+function bucketize(levels){
+  const b=Math.max(5,niceStep((pw.hi-pw.lo)/60)),m=new Map();
+  for(const [p,usd] of levels)m.set(Math.round(p/b)*b,(m.get(Math.round(p/b)*b)||0)+usd);
+  return [...m.entries()];
+}
+async function pollBook(){
+  let got=null;
+  for(const base of ['https://data-api.binance.vision','https://api.binance.com']){
+    try{
+      const r=await fetch(base+'/api/v3/depth?symbol=BTCUSDT&limit=500',{signal:AbortSignal.timeout(6000)});
+      if(!r.ok)throw 0;
+      const d=await r.json();
+      got={bids:d.bids.map(v=>[+v[0],+v[0]*+v[1]]),asks:d.asks.map(v=>[+v[0],+v[0]*+v[1]])};
+      break;
+    }catch(e){}
+  }
+  if(!got){
+    try{
+      const r=await fetch('https://api.exchange.coinbase.com/products/BTC-USD/book?level=2',{signal:AbortSignal.timeout(6000)});
+      if(!r.ok)throw 0;
+      const d=await r.json();
+      got={bids:d.bids.slice(0,500).map(v=>[+v[0],+v[0]*+v[1]]),
+           asks:d.asks.slice(0,500).map(v=>[+v[0],+v[0]*+v[1]])};
+    }catch(e){}
+  }
+  if(!got&&lastPrice){ // simulation book
+    const mk=dir=>{const a=[];const rnd=Math.random;
+      for(let k=1;k<=60;k++){let usd=3e4+rnd()**2*4e5;
+        if(rnd()<0.05)usd+=2e6+rnd()*6e6;
+        a.push([lastPrice+dir*k*8,usd]);}
+      return a};
+    got={bids:mk(-1),asks:mk(1)};
+  }
+  if(got){book.bids=got.bids;book.asks=got.asks;rebuildBook();}
+  setTimeout(pollBook,4000);
+}
+function layoutBookSide(mesh,levels,bull){
+  const n=candles.length;if(!n)return null;
+  const xF=secX(n-1)+SEC*0.7;
+  const buckets=bucketize(levels);
+  const tot=levels.reduce((s,v)=>s+v[1],0);
+  const unit=Math.max(tot/(BOOKCAP*0.92),1.5e4);
+  let idx=0;
+  for(const [p,usd] of buckets){
+    if(p<=pw.lo||p>=pw.hi)continue;
+    const z0=zOfPrice(p);
+    const cnt=clamp(Math.round(usd/unit),1,150);
+    const rows=Math.ceil(cnt/40);
+    const rnd=mulberry32(p|0);           // deterministic → formations don't shimmer between polls
+    for(let k=0;k<cnt&&idx<BOOKCAP;k++,idx++){
+      const row=Math.floor(k/40),col=k%40;
+      const x=xF+5+col*2.3+row*1.15+rnd()*0.8;
+      const z=z0+(row-(rows-1)/2)*1.6+(rnd()-.5)*0.9;
+      dummy.position.set(x,groundH(x,z),z);
+      dummy.rotation.set(0,rnd()*0.3+(bull?-1.57:1.57),0); // formation faces the front
+      dummy.scale.setScalar(0.95+rnd()*0.2);
+      dummy.updateMatrix();mesh.setMatrixAt(idx,dummy.matrix);
+      mesh.setColorAt(idx,bull
+        ?tmpC.setHSL(0.10+rnd()*0.035,0.72,0.42+rnd()*0.16)
+        :tmpC.setHSL(0.965+rnd()*0.02,0.68,0.40+rnd()*0.14));
+    }
+  }
+  const d=dummy;
+  d.position.set(0,-999,0);d.scale.setScalar(0.0001);d.updateMatrix();
+  for(let k=idx;k<BOOKCAP;k++)mesh.setMatrixAt(k,d.matrix);
+  mesh.instanceMatrix.needsUpdate=true;
+  if(mesh.instanceColor)mesh.instanceColor.needsUpdate=true;
+  return buckets;
+}
+function rebuildBook(){
+  if(!candles.length||!book.bids.length)return;
+  const bb=layoutBookSide(bookB,book.bids,true);
+  const aa=layoutBookSide(bookR,book.asks,false);
+  const sum=a=>a.reduce((s,v)=>s+v[1],0);
+  buyWallEl.textContent='BUY WALL '+fmtUsd(sum(book.bids));
+  sellWallEl.textContent='SELL WALL '+fmtUsd(sum(book.asks));
+  // label the 3 biggest walls per side
+  let li=0;
+  const xF=secX(candles.length-1)+SEC*0.7;
+  for(const [bull,buckets] of [[true,bb],[false,aa]]){
+    if(!buckets)continue;
+    const top=buckets.filter(([p])=>p>pw.lo&&p<pw.hi).sort((x,y)=>y[1]-x[1]).slice(0,3);
+    for(const [p,usd] of top){
+      const L=wallLabels[li++],z=zOfPrice(p);
+      const txt=(bull?'🛡 ':'⚔ ')+fmtP(p)+' · '+fmtUsd(usd);
+      L.ctx.clearRect(0,0,460,96);
+      L.ctx.font='700 38px "IBM Plex Mono",monospace';
+      L.ctx.textAlign='left';L.ctx.textBaseline='middle';
+      L.ctx.lineWidth=9;L.ctx.lineJoin='round';L.ctx.strokeStyle='rgba(6,7,11,.9)';
+      L.ctx.strokeText(txt,8,48);
+      L.ctx.fillStyle=bull?'#ffd97a':'#ff6b7d';
+      L.ctx.fillText(txt,8,48);
+      L.tex.needsUpdate=true;
+      L.spr.position.set(xF+115,groundH(xF+115,z)+9,z);
+      L.spr.scale.set(30,30*96/460,1);
+      L.spr.visible=true;
+    }
+  }
+  for(;li<8;li++)wallLabels[li].spr.visible=false;
+}
+
 /* ================= FLOATING TRADE AMOUNTS ================= */
 const FLOAT_MIN=25e3;              // trades below this stay anonymous foot-soldiers
 const floats=[],floatFree=[];
@@ -1066,7 +1196,7 @@ function animate(){
   const moved=Math.abs(pw.tlo-pw.lo)+Math.abs(pw.thi-pw.hi);
   if(moved>0.01){pw.lo=lerp(pw.lo,pw.tlo,0.03);pw.hi=lerp(pw.hi,pw.thi,0.03);needMap=true;}
   mapT-=dt;
-  if(needMap&&mapT<=0){mapT=0.25;drawMap();}
+  if(needMap&&mapT<=0){mapT=0.25;drawMap();rebuildBook();} // book formations track the shifting price window
   if(nowT-lastBalance>2){lastBalance=nowT;fitWindow();balanceArmies();}
   updateArmies(dt,nowT);
   updateFlags();
@@ -1110,11 +1240,12 @@ window.addEventListener('resize',()=>{
   controls.target.copy(fp);
   camera.position.set(fp.x+30,55,fp.z+110);
   connectWS();
+  pollBook();
   animate();
 })();
 
 /* console test hooks (same muscle memory as classic) */
-window.candles=candles;
+window.candles=candles;window.book=book;
 window.cam=camera;window.ctl=controls;window.noFollow=()=>{follow=false;};
 window.spawnCataclysm=(ci,price,isBull,usd)=>spawnCataclysm(ci??candles.length-1,price??lastPrice,isBull,usd??8e6);
 window.testTrade=(usd,isBull)=>onTrade(lastPrice||65000,usd,isBull,Date.now());
