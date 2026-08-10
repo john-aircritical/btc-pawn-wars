@@ -153,7 +153,7 @@ const FRONT_AMP=DEPTH*0.62;     // how far the frontline can swing
 const TEXW=3072,TEXH=768;
 const PXC=TEXW/MAXC;            // texture px per sector
 const ACTIVE_SECTORS=30;        // sectors behind the front that keep full armies
-const POOL=2600;                // instanced units per side
+const POOL=4600;                // instanced units per side
 
 /* ================= SMALL UTILS ================= */
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
@@ -165,7 +165,7 @@ const fmtP=p=>p>=1000?p.toLocaleString('en-US',{maximumFractionDigits:0}):p.toFi
 
 /* ================= MARKET STATE ================= */
 const candles=[];
-let lastPrice=0,priceDir=0,mode='dead';
+let lastPrice=0,priceDir=0,mode='dead',avgVol=1;  // avgVol = per-side avg $ per minute
 const pw={lo:0,hi:1,tlo:0,thi:1};      // smoothed price window → frontline mapping
 let needMap=true, shake=0;
 
@@ -178,9 +178,10 @@ function frontZAtX(x){
   const a=zOfPrice(candles[i].c),b=zOfPrice(candles[Math.min(i+1,n-1)].c);
   return lerp(a,b,t);}
 function fitWindow(){
-  let lo=Infinity,hi=-Infinity;
-  for(const c of candles){if(c.c<lo)lo=c.c;if(c.c>hi)hi=c.c;}
+  let lo=Infinity,hi=-Infinity,v=0;
+  for(const c of candles){if(c.c<lo)lo=c.c;if(c.c>hi)hi=c.c;v+=c.bull+c.bear;}
   if(lo===Infinity)return;
+  avgVol=Math.max(v/(candles.length*2),1e4);
   const pad=Math.max((hi-lo)*0.12,lo*0.0004);
   pw.tlo=lo-pad;pw.thi=hi+pad;
   if(pw.lo===0){pw.lo=pw.tlo;pw.hi=pw.thi;}
@@ -317,6 +318,16 @@ function drawMap(){
     mctx.lineJoin='round';mctx.lineCap='round';
     mctx.strokeStyle='rgba(58,42,26,.55)';mctx.lineWidth=26;mctx.stroke(path);
     mctx.strokeStyle='rgba(30,20,12,.5)';mctx.lineWidth=12;mctx.stroke(path);
+    // battle scars — one churned patch per minute, sized by its volume
+    for(let i=0;i<n;i++){
+      const c=candles[i];
+      const r=clamp(3+Math.sqrt((c.bull+c.bear)/(avgVol*2))*7,3,24);
+      const bx=pxX(secX(i)),by=pxY(zOfPrice(c.c));
+      mctx.fillStyle='rgba(42,30,17,.5)';
+      mctx.beginPath();mctx.ellipse(bx,by,r,r*.6,0,0,6.29);mctx.fill();
+      mctx.fillStyle='rgba(18,11,7,.5)';
+      mctx.beginPath();mctx.ellipse(bx,by,r*.5,r*.3,0,0,6.29);mctx.fill();
+    }
     // frontline glow
     mctx.strokeStyle='rgba(255,200,110,.16)';mctx.lineWidth=18;mctx.stroke(path);
     mctx.strokeStyle='rgba(255,225,150,.35)';mctx.lineWidth=8;mctx.stroke(path);
@@ -446,7 +457,9 @@ function scatter(count,zMin,zMax,seed){
 const soldierGeo=(()=>{
   const body=new THREE.CylinderGeometry(.42,.6,1.7,6);body.translate(0,.85,0);
   const head=new THREE.SphereGeometry(.42,7,6);head.translate(0,2.0,0);
-  return mergeGeometries([body,head]);
+  const spear=new THREE.CylinderGeometry(.045,.045,2.7,4);
+  spear.rotateX(Math.PI/10);spear.translate(.44,1.6,.24);
+  return mergeGeometries([body,head,spear]);
 })();
 function makeArmy(){
   const m=new THREE.InstancedMesh(soldierGeo,
@@ -458,6 +471,34 @@ function makeArmy(){
 const meshB=makeArmy(),meshR=makeArmy();
 scene.add(meshB,meshR);
 const dummy=new THREE.Object3D(),tmpC=new THREE.Color();
+
+/* per-battle winner flags — one per sector, sized by that minute's volume */
+const flagGeo=(()=>{
+  const pole=new THREE.CylinderGeometry(.09,.12,7.5,5);pole.translate(0,3.75,0);
+  const cloth=new THREE.BoxGeometry(2.4,1.35,.08);cloth.translate(1.35,6.6,0);
+  return mergeGeometries([pole,cloth]);
+})();
+const flags=new THREE.InstancedMesh(flagGeo,new THREE.MeshLambertMaterial({emissiveIntensity:.35}),MAXC);
+flags.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+flags.frustumCulled=false;scene.add(flags);
+function updateFlags(){
+  const n=candles.length;
+  for(let i=0;i<MAXC;i++){
+    const c=candles[i];
+    if(!c){dummy.position.set(0,-999,0);dummy.scale.setScalar(0.0001);dummy.updateMatrix();
+      flags.setMatrixAt(i,dummy.matrix);continue;}
+    const up=c.c>=c.o,x=secX(i);
+    const z=frontZAtX(x)+(up?4:-4);   // planted just inside the winner's ground
+    const sc=clamp(0.75+Math.sqrt((c.bull+c.bear)/(avgVol*2))*0.5,0.75,2.2);
+    dummy.position.set(x,groundH(x,z),z);
+    dummy.rotation.set(0,up?0:Math.PI,0);
+    dummy.scale.setScalar(sc);
+    dummy.updateMatrix();flags.setMatrixAt(i,dummy.matrix);
+    flags.setColorAt(i,tmpC.setHex(up?0xe8b64c:0xe0364f));
+  }
+  flags.instanceMatrix.needsUpdate=true;
+  if(flags.instanceColor)flags.instanceColor.needsUpdate=true;
+}
 
 function newSide(mesh,bull){
   const units=new Array(POOL),free=[];
@@ -476,15 +517,21 @@ function unitColor(bull,rank){
   else tmpC.setHSL(0.975+r()*0.02-0.01,0.68,0.40+r()*0.14+rank*0.05);
   return tmpC;
 }
+function battleR(sec){ // melee-knot radius for a sector, scaled by that minute's $ volume
+  const c=candles[sec];if(!c)return 3;
+  return clamp(2.2+Math.sqrt((c.bull+c.bear)/(avgVol*2))*3.2,2.5,9);
+}
 function spawnUnit(S,sec,rank,atLine,champ){
   if(!S.free.length){reclaimOldest(S);if(!S.free.length)return null;}
   const i=S.free.pop();
   const side=S.bull?1:-1;
-  const bx=secX(sec)+(Math.random()-.5)*SEC*0.86;
-  const front=frontZAtX(bx);
-  const gap=2.2+(i%3)*2.1+Math.random()*1.4;
-  const u={i,sec,rank,side,champ:!!champ,
-    x:bx,z:atLine?front+side*gap:front+side*(30+Math.random()*46),
+  const R=battleR(sec);
+  const tx=secX(sec)+(champ?0:(Math.random()+Math.random()-1)*R); // cluster into a knot
+  const front=frontZAtX(tx);
+  const gap=1.1+Math.random()*R*0.75;
+  const u={i,sec,rank,side,champ:!!champ,tx,
+    x:atLine?tx:tx+(Math.random()-.5)*6,
+    z:atLine?front+side*gap:front+side*(34+Math.random()*50),
     gap,ph:Math.random()*6.28,sp:.75+Math.random()*.7,
     yaw:Math.random()*6.28,
     sc:(champ?[1,1,1,2.6,3.2,4.2][rank]:(rank>=1?1.55:0.95+Math.random()*.25)),
@@ -506,7 +553,8 @@ function reclaimOldest(S){
   for(const u of S.units)if(u&&!u.champ&&(best===null||u.sec<best.sec))best=u;
   if(best)freeUnit(S,best);
 }
-function desiredCount(usd){return clamp(Math.round(7*Math.log10(usd/1e3+1)),2,52);}
+function desiredCount(usd){ // troops scale with volume RELATIVE to the session's average minute
+  return clamp(Math.round(Math.pow(usd/avgVol,0.6)*14),3,110);}
 function sectorCount(S,sec){let n=0;
   for(const u of S.units)if(u&&u.sec===sec&&u.state!=='dead')n++;
   return n;}
@@ -521,8 +569,9 @@ function balanceArmies(){
   for(let i=0;i<n;i++){
     const c=candles[i],recent=i>=n-ACTIVE_SECTORS;
     let wantB=desiredCount(c.bull),wantR=desiredCount(c.bear);
-    if(!recent){wantB=Math.min(wantB,4);wantR=Math.min(wantR,4);}
-    const spawnRate=recent?wantB:1;
+    if(!recent){ // settled battles keep a garrison sized by how big the fight was
+      wantB=clamp(Math.round(wantB*0.3),3,16);wantR=clamp(Math.round(wantR*0.3),3,16);}
+    const spawnRate=recent?Math.max(8,Math.ceil(wantB/3)):1; // reinforcements stream in waves
     for(let k=cntB[i];k<wantB&&k<cntB[i]+spawnRate;k++)spawnUnit(sideB,i,(k%6===5)?1:0,!recent||i<n-1);
     for(let k=cntR[i];k<wantR&&k<cntR[i]+spawnRate;k++)spawnUnit(sideR,i,(k%6===5)?1:0,!recent||i<n-1);
     if(!recent){
@@ -567,6 +616,8 @@ function updateArmies(dt,t){
         continue;
       }
       if(u.champ&&t-u.bornT>u.lifeT){dieUnit(S,u,false);continue;}
+      const dx=u.tx-u.x;
+      if(Math.abs(dx)>0.6)u.x+=Math.sign(dx)*Math.min(Math.abs(dx),5*u.sp*dt);
       const front=frontZAtX(u.x);
       const tz=front+side*u.gap;
       const dz=tz-u.z;
@@ -587,7 +638,7 @@ function updateArmies(dt,t){
 }
 
 /* ================= PARTICLES ================= */
-const PMAX=4200;
+const PMAX=6500;
 const pGeo=new THREE.BufferGeometry();
 const pPos=new Float32Array(PMAX*3),pCol=new Float32Array(PMAX*3);
 pGeo.setAttribute('position',new THREE.BufferAttribute(pPos,3));
@@ -818,7 +869,7 @@ async function loadKlines(){
 function worldShift(){
   candles.shift();
   for(const S of [sideB,sideR])for(const u of S.units)
-    if(u){u.x-=SEC;u.sec--;if(u.sec<0)freeUnit(S,u);}
+    if(u){u.x-=SEC;u.tx-=SEC;u.sec--;if(u.sec<0)freeUnit(S,u);}
   for(const f of fxList){
     if(f.from)f.from.x-=SEC;if(f.to)f.to.x-=SEC;
     if(f.o)f.o.position.x-=SEC;
@@ -937,12 +988,21 @@ let sparkT=0;
 function ambientSparks(dt){
   sparkT-=dt;
   if(sparkT>0)return;
-  sparkT=0.09;
+  sparkT=0.05;
   const n=candles.length;if(!n)return;
-  const i=n-1-Math.floor(Math.random()*Math.random()*Math.min(ACTIVE_SECTORS,n));
-  const x=secX(i)+(Math.random()-.5)*SEC,z=frontZAtX(x);
-  spawnParticles(x,groundH(x,z)+1.6,z,3,
+  // volume-weighted pick: sample two recent sectors, fight where the money is
+  const pick=()=>n-1-Math.floor(Math.random()*Math.random()*Math.min(ACTIVE_SECTORS,n));
+  let i=pick();const j=pick();
+  const vol=k=>candles[k].bull+candles[k].bear;
+  if(vol(j)>vol(i))i=j;
+  const heat=vol(i)/(avgVol*2);
+  const R=battleR(i);
+  const x=secX(i)+(Math.random()-.5)*R*1.6,z=frontZAtX(x);
+  const y=groundH(x,z);
+  spawnParticles(x,y+1.6,z,2+Math.min(5,Math.round(heat*2)),
     {speed:5,up:1.8,boost:4,life:0.5,colA:0xfff2c8,colB:Math.random()<.5?0xe8b64c:0xe0364f,grav:18});
+  if(heat>1.6)  // big-money minute → battle haze column
+    spawnParticles(x,y+2.5,z,2,{speed:1.6,up:2.4,boost:5,life:2.6,colA:0x4a4640,colB:0x2a2624,grav:-2});
 }
 
 /* ================= MAIN LOOP ================= */
@@ -959,6 +1019,7 @@ function animate(){
   if(needMap&&mapT<=0){mapT=0.25;drawMap();}
   if(nowT-lastBalance>2){lastBalance=nowT;fitWindow();balanceArmies();}
   updateArmies(dt,nowT);
+  updateFlags();
   updateParticles(dt);
   updateFX(dt);
   ambientSparks(dt);
