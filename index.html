@@ -778,6 +778,54 @@ function scorchDot(x,z,rPx,bull){
   needMap=true;
 }
 
+/* ================= FLOATING TRADE AMOUNTS ================= */
+const FLOAT_MIN=25e3;              // trades below this stay anonymous foot-soldiers
+const floats=[],floatFree=[];
+for(let i=0;i<32;i++){
+  const c=document.createElement('canvas');c.width=360;c.height=120;
+  const tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;
+  const spr=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,
+    depthTest:false,depthWrite:false,fog:false}));
+  spr.renderOrder=999;spr.visible=false;scene.add(spr);
+  floatFree.push({spr,tex,ctx:c.getContext('2d'),x:0,z:0,y0:0,t:0,dur:1,w:10});
+}
+let lastFloatT=-9;
+function spawnFloat(ci,usd,bull,rank){
+  if(usd<1e5&&nowT-lastFloatT<0.15)return;   // rate-limit the small stuff, never the whales
+  lastFloatT=nowT;
+  const f=floatFree.pop()||floats.shift();
+  const {ctx,tex,spr}=f;
+  ctx.clearRect(0,0,360,120);
+  const txt=(rank>=3?RANKS[rank].g+' ':'')+(bull?'+':'−')+fmtUsd(usd);
+  ctx.font='700 56px "IBM Plex Mono",monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.lineWidth=11;ctx.lineJoin='round';ctx.strokeStyle='rgba(6,7,11,.92)';
+  ctx.strokeText(txt,180,60);
+  ctx.fillStyle=bull?'#ffd97a':'#ff6b7d';
+  ctx.fillText(txt,180,60);
+  tex.needsUpdate=true;
+  const x=secX(ci)+(Math.random()-.5)*battleR(ci)*1.5;
+  const z=frontZAtX(x)+(bull?1:-1)*(2+Math.random()*4);
+  const big=rank>=3;
+  f.x=x;f.z=z;f.y0=groundH(x,z)+(big?7:4.5);
+  f.t=0;f.dur=big?2.4:1.6;
+  f.w=(big?15:8)+Math.log10(usd/FLOAT_MIN+1)*7;
+  spr.position.set(x,f.y0,z);
+  spr.scale.set(f.w,f.w/3,1);
+  spr.material.opacity=1;spr.visible=true;
+  floats.push(f);
+}
+function updateFloats(dt){
+  for(let k=floats.length-1;k>=0;k--){
+    const f=floats[k];f.t+=dt;
+    const q=f.t/f.dur;
+    if(q>=1){f.spr.visible=false;floats.splice(k,1);floatFree.push(f);continue;}
+    const rise=1-Math.pow(1-q,2.2);
+    f.spr.position.set(f.x,f.y0+rise*13,f.z);
+    f.spr.material.opacity=q<.7?1:1-(q-.7)/.3;
+  }
+}
+
 /* ================= ATTACKS (chess ranks) ================= */
 function atkOrigin(ci,bull,spread){
   const x=secX(ci)+(Math.random()-.5)*spread;
@@ -874,6 +922,7 @@ function worldShift(){
     if(f.from)f.from.x-=SEC;if(f.to)f.to.x-=SEC;
     if(f.o)f.o.position.x-=SEC;
   }
+  for(const f of floats){f.x-=SEC;f.spr.position.x-=SEC;}
   // slide + slightly heal the scorch layer
   const tmp=document.createElement('canvas');tmp.width=TEXW;tmp.height=TEXH;
   const tc=tmp.getContext('2d');
@@ -899,6 +948,7 @@ function onTrade(price,usd,isBull,ts){
   else if(r===3) spawnVolley(ci,price,isBull,usd);
   else if(r===4) spawnSlash(ci,price,isBull,usd);
   else if(r===5) spawnCataclysm(ci,price,isBull,usd);
+  if(usd>=FLOAT_MIN)spawnFloat(ci,usd,isBull,r);
   if(usd>=KILL_MIN)killfeed(r,usd,price,isBull);
   needMap=true;
   updateHUD();
@@ -1020,6 +1070,7 @@ function animate(){
   if(nowT-lastBalance>2){lastBalance=nowT;fitWindow();balanceArmies();}
   updateArmies(dt,nowT);
   updateFlags();
+  updateFloats(dt);
   updateParticles(dt);
   updateFX(dt);
   ambientSparks(dt);
